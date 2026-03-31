@@ -10,65 +10,78 @@ import {
 } from '@evenrealities/even_hub_sdk';
 
 type InputAction = 'CLICK' | 'UP' | 'DOWN' | 'DOUBLE_CLICK';
-type CountEventType = 'LOW' | 'NEUTRAL' | 'HIGH';
-type HudMode = 'COUNT' | 'MENU' | 'DECKS' | 'CHEAT';
+type KdsMode = 'ORDERS' | 'ORDER_DETAIL' | 'CONFIRM';
 
-type CountEvent = {
-  type: CountEventType;
-  delta: number;
+type KdsOrder = {
+  id: string;
+  displayId: string;
+  customerName: string;
+  itemLines: string[];
+  noteLines: string[];
+  createdAt: number;
+  state: string;
+  fulfillmentState: string;
+  version: number;
 };
 
+type ConfirmChoice = 'COMPLETE' | 'NOT_HERE';
+
 type AppState = {
-  runningCount: number;
-  cardsSeen: number;
-  decksTotal: number;
-  showCheatOnMain: boolean;
+  hudMode: KdsMode;
+  orders: KdsOrder[];
+  notHereOrders: KdsOrder[];
+  notHereAt: Record<string, number>;
+  selectedIndex: number;
+  confirmChoice: ConfirmChoice;
+  filterOpenOnly: boolean;
+  lastSync: number;
+  syncStatus: 'OK' | 'POLLING' | 'ERROR' | 'IDLE';
+  lastAction: string;
   publishStatus: string;
   deployed: boolean;
-  lastAction: string;
-  history: CountEvent[];
-  hudMode: HudMode;
-  menuIndex: number;
-  disclaimerAccepted: boolean;
 };
 
 const MAIN_CONTAINER_ID = 1;
 const MAIN_CONTAINER_NAME = 'mainText';
 const CONTROL_URL = 'http://127.0.0.1:8787';
-const REQUIRED_CONTROL_CAPABILITY = 'publish-app';
+const REQUIRED_CONTROL_CAPABILITY = 'square-kds';
 const DISPLAY_WIDTH = 576;
 const MAIN_PANEL_X = 24;
 const MAIN_PANEL_WIDTH = 528;
 const HIDE_DEBUG_TOOLS = true;
 const DEV_TOOLS_TOGGLE_SHORTCUT = 'Ctrl+Shift+D';
 const MAX_APP_NAME_LENGTH = 20;
-const DISCLAIMER_SECONDS = 15;
+const LINE_WIDTH = 56;
 
-const MENU_ITEMS = ['Undo Last Card', 'New Shoe', 'Adjust Decks', 'Cheat Sheet', 'Close Menu'] as const;
 
 const state: AppState = {
-  runningCount: 0,
-  cardsSeen: 0,
-  decksTotal: 6,
-  showCheatOnMain: false,
+  hudMode: 'ORDERS',
+  orders: [],
+  notHereOrders: [],
+  notHereAt: {},
+  selectedIndex: 0,
+  confirmChoice: 'COMPLETE',
+  filterOpenOnly: true,
+  lastSync: 0,
+  syncStatus: 'IDLE',
+  lastAction: 'Starting...',
   publishStatus: 'IDLE',
   deployed: false,
-  lastAction: 'Ready',
-  history: [],
-  hudMode: 'COUNT',
-  menuIndex: 0,
-  disclaimerAccepted: false,
 };
 
 let bridge: EvenAppBridge | null = null;
 let startupCreated = false;
-let startupMs = Date.now();
 let lastResolvedAction: InputAction | null = null;
 let lastResolvedActionAt = 0;
 let lastEventSignature = '';
 let lastEventAt = 0;
 let lastEventLabel = '';
 let debugToolsVisible = !HIDE_DEBUG_TOOLS;
+let lastCompletedName = '';
+let lastCompletedAt = 0;
+let nhPanOffset = 0; // character pan position for not-here banner
+// Grace period set: IDs optimistically removed pending Square confirmation (cleared after 30s)
+const pendingCompleteIds = new Map<string, number>(); // id → timestamp
 
 const app = document.querySelector<HTMLDivElement>('#app');
 if (!app) throw new Error('Missing #app root element');
@@ -76,23 +89,42 @@ if (!app) throw new Error('Missing #app root element');
 app.innerHTML = `
   <main class="hud-shell">
     <fieldset class="group-box">
-      <legend>Blackjack Counter Setup</legend>
+      <legend>Square KDS Config</legend>
       <div class="settings-row">
         <div class="mini-field wide-field">
-          <label for="decks-total">Shoe Decks</label>
-          <input id="decks-total" type="number" min="1" max="8" step="0.5" value="6" />
+          <label for="square-token">Access Token</label>
+          <input id="square-token" type="password" placeholder="EAAAl..." autocomplete="off" />
+        </div>
+        <span id="kds-status-dot" class="kds-status-dot kds-dot-idle" title="Not configured"></span>
+      </div>
+      <div class="settings-row">
+        <div class="mini-field wide-field">
+          <label for="square-location">Location ID</label>
+          <input id="square-location" type="text" placeholder="L..." />
         </div>
       </div>
       <div class="settings-row">
-        <label class="legend-toggle" for="show-cheat-main">
-          <span>Show HI-LO CHEAT on main screen</span>
-          <input id="show-cheat-main" type="checkbox" />
-        </label>
+        <div class="mini-field">
+          <label for="square-env">Environment</label>
+          <select id="square-env">
+            <option value="sandbox">Sandbox</option>
+            <option value="production">Production</option>
+          </select>
+        </div>
       </div>
-      <p class="hint">On glasses: Click=Low, Up=High, Down=Neutral, Double-click=Menu</p>
-      <p class="hint">RC = Running Count, TC = True Count</p>
-      <p class="hint">Menu actions: undo, new shoe, deck adjust, and card cheat sheet</p>
-      <p class="hint">Disclaimer: Training tool only. Casino use may violate house rules or state laws.</p>
+      <div class="settings-row">
+        <button id="square-save-btn" type="button">Save &amp; Connect</button>
+        <span id="square-status-text" class="hint" style="margin:0;"></span>
+      </div>
+      <div class="settings-row">
+        <div class="mini-field">
+          <label for="urgent-mins">Urgent after</label>
+          <input id="urgent-mins" type="number" min="1" max="60" value="10" />
+          <span class="field-unit">min</span>
+        </div>
+      </div>
+      <p class="hint">On glasses: Up/Down=scroll, Click=open order, Double-click=refresh</p>
+      <p class="hint">In order detail: Click=mark done, Double-click=back</p>
     </fieldset>
 
     <fieldset id="debug-tools" class="group-box" ${HIDE_DEBUG_TOOLS ? 'style="display:none;"' : ''}>
@@ -100,6 +132,8 @@ app.innerHTML = `
       <div class="controls">
         <button id="publish-btn" type="button">Publish App</button>
         <button id="ehpk-btn" type="button">Build EHPK</button>
+        <button id="test-order-btn" type="button">+ Test Order</button>
+        <button id="clear-orders-btn" type="button">Clear All Orders</button>
         <span id="publish-status">IDLE</span>
       </div>
       <pre id="event-log" class="event-log"></pre>
@@ -117,11 +151,17 @@ const hudMainPreview = document.querySelector<HTMLPreElement>('#hud-main-preview
 const publishBtn = document.querySelector<HTMLButtonElement>('#publish-btn')!;
 const ehpkBtn = document.querySelector<HTMLButtonElement>('#ehpk-btn')!;
 const debugToolsFieldset = document.querySelector<HTMLElement>('#debug-tools')!;
-const decksTotalInput = document.querySelector<HTMLInputElement>('#decks-total')!;
-const showCheatMainInput = document.querySelector<HTMLInputElement>('#show-cheat-main')!;
+const testOrderBtn = document.querySelector<HTMLButtonElement>('#test-order-btn')!;
+const clearOrdersBtn = document.querySelector<HTMLButtonElement>('#clear-orders-btn')!;
 const publishStatus = document.querySelector<HTMLSpanElement>('#publish-status')!;
 const eventLog = document.querySelector<HTMLPreElement>('#event-log')!;
 const publishLog = document.querySelector<HTMLPreElement>('#publish-log')!;
+const squareTokenInput = document.querySelector<HTMLInputElement>('#square-token')!;
+const squareLocationInput = document.querySelector<HTMLInputElement>('#square-location')!;
+const squareEnvSelect = document.querySelector<HTMLSelectElement>('#square-env')!;
+const squareSaveBtn = document.querySelector<HTMLButtonElement>('#square-save-btn')!;
+const squareStatusText = document.querySelector<HTMLSpanElement>('#square-status-text')!;
+const kdsStatusDot = document.querySelector<HTMLSpanElement>('#kds-status-dot')!;
 const eventLines: string[] = [];
 
 const mainPanelLeftPercent = (MAIN_PANEL_X / DISPLAY_WIDTH) * 100;
@@ -129,123 +169,184 @@ const mainPanelWidthPercent = (MAIN_PANEL_WIDTH / DISPLAY_WIDTH) * 100;
 hudMainPreview.style.left = `${mainPanelLeftPercent}%`;
 hudMainPreview.style.width = `${mainPanelWidthPercent}%`;
 
-function clampFloat(value: number, min: number, max: number): number {
-  if (!Number.isFinite(value)) return min;
-  return Math.max(min, Math.min(max, value));
-}
-
 function clampAppName(value: string): string {
   return String(value || '').trim().slice(0, MAX_APP_NAME_LENGTH);
 }
 
-function decksRemaining(): number {
-  const cardsLeft = Math.max(0, state.decksTotal * 52 - state.cardsSeen);
-  const remaining = cardsLeft / 52;
-  return Math.max(0.25, remaining);
+function truncateName(name: string, maxLen: number): string {
+  const n = (name || 'Unknown').trim();
+  if (n.length <= maxLen) return n;
+  return n.slice(0, maxLen - 1) + '\u2026';
 }
 
-function trueCount(): number {
-  return state.runningCount / decksRemaining();
+let urgentMinutes = 10; // configurable via browser UI
+
+function isUrgent(createdAtMs: number): boolean {
+  return (Date.now() - createdAtMs) > urgentMinutes * 60 * 1000;
 }
 
-function recommendation(): string {
-  const tc = trueCount();
-  if (tc >= 4) return 'Bet max spread';
-  if (tc >= 3) return 'Bet 3x-4x base';
-  if (tc >= 2) return 'Bet 2x base';
-  if (tc >= 1) return 'Bet base';
-  return 'Bet table min';
+function formatOrderRow(order: KdsOrder, selected: boolean): string {
+  const cursor = selected ? '>' : ' ';
+  // name up to 10 chars, then wait time mm:ss, then item names
+  const name = truncateName(order.customerName, 10).padEnd(10);
+  const wait = formatWaitTime(Date.now() - order.createdAt);
+  const urgent = isUrgent(order.createdAt) ? '!' : ' ';
+  // item names joined, truncated to fill remaining space
+  const topItems = order.itemLines
+    .filter(l => !l.startsWith('   '))
+    .map(l => l.replace(/^\d+ x /, ''))
+    .join(', ');
+  // layout: cursor(1) name(10) space(1) wait(5) urgent(1) = 18 chars used; rest for items
+  const itemsMaxLen = LINE_WIDTH - 18;
+  const itemsSummary = truncateName(topItems, itemsMaxLen);
+  return `${cursor}${name} ${urgent}${wait} ${itemsSummary}`;
 }
 
-function advantageEstimate(): number {
-  const tc = trueCount();
-  return (tc - 1) * 0.5;
+function syncHeaderLine(): string {
+  const age = state.lastSync > 0 ? Math.floor((Date.now() - state.lastSync) / 1000) : -1;
+  if (state.syncStatus === 'ERROR' || age > 120) return '[ KDS OFFLINE ]';
+  if (age > 30 || state.syncStatus === 'IDLE') return   '[ KDS ~stale ]';
+  if (lastCompletedName && Date.now() - lastCompletedAt < 5000) {
+    return `Done: ${truncateName(lastCompletedName, 10)}`;
+  }
+  return '[ KDS ONLINE ]';
 }
 
-function signedRounded(value: number, digits = 1): string {
-  const rounded = Number(value.toFixed(digits));
-  return `${rounded >= 0 ? '+' : ''}${rounded.toFixed(digits)}`;
+function formatWaitTime(ms: number): string {
+  const totalSecs = Math.floor(ms / 1000);
+  const mins = Math.floor(totalSecs / 60);
+  const secs = totalSecs % 60;
+  return `${mins.toString().padStart(2, '0')}m${secs.toString().padStart(2, '0')}s`;
 }
 
-function disclaimerRemainingSeconds(nowMs = Date.now()): number {
-  const elapsed = Math.max(0, nowMs - startupMs);
-  const remainingMs = Math.max(0, DISCLAIMER_SECONDS * 1000 - elapsed);
-  return Math.ceil(remainingMs / 1000);
+// Helpers: unified index — not-here orders occupy 0..nhCount-1, open orders nhCount..total-1
+// This means UP in detail view naturally navigates from open orders into not-here orders above.
+function isNotHereIdx(idx: number): boolean { return idx < state.notHereOrders.length; }
+function getOrderAtIdx(idx: number): KdsOrder | null {
+  if (idx < 0) return null;
+  if (idx < state.notHereOrders.length) return state.notHereOrders[idx];
+  const openIdx = idx - state.notHereOrders.length;
+  return state.orders[openIdx] ?? null;
 }
 
-function buildMenuHudText(): string {
-  return [
-    'COMMAND MENU',
-    `${state.menuIndex === 0 ? '>' : ' '} Undo Last`,
-    `${state.menuIndex === 1 ? '>' : ' '} New Shoe`,
-    `${state.menuIndex === 2 ? '>' : ' '} Adjust Decks`,
-    `${state.menuIndex === 3 ? '>' : ' '} Cheat Sheet`,
-    `${state.menuIndex === 4 ? '>' : ' '} Close`,
-  ].join('\n');
-}
+function buildOrdersHudText(): string {
+  const header = syncHeaderLine();
+  const openCount = state.orders.length;
+  const nhCount = state.notHereOrders.length;
+  const headerLine = nhCount > 0
+    ? `${header} | ${nhCount} Not Here | ${openCount} Open`
+    : `${header} | ${openCount} Order${openCount !== 1 ? 's' : ''}:`;
 
-function buildDeckHudText(): string {
-  return [
-    'DECK ADJUST',
-    `Current ${state.decksTotal.toFixed(1)} decks`,
-    '\nUP +0.5',
-    'DOWN -0.5',
-    '\nCLICK save+exit',
-    'DBL exit',
-  ].join('\n');
-}
+  if (openCount === 0 && nhCount === 0) {
+    return [headerLine, '', '  No open orders', '', '', '', '', '', '', 'DBL:Refresh'].join('\n');
+  }
 
-function buildCheatHudText(): string {
-  return [
-    'HI-LO CHEAT',
-    '(CLICK) +1 : 2 3 4 5 6',
-    '(DOWN)   0 : 7 8 9',
-    '(UP)    -1 : 10 J Q K A',
-    '\n\nCLICK or DBL to return',
-  ].join('\n');
-}
+  // Build virtual display rows: not-here orders first (at top), then separator, then open orders.
+  // Index scheme: not-here = 0..nhCount-1, open = nhCount..total-1
+  type VRow = { text: string; selIdx: number | null };
+  const rows: VRow[] = [];
+  for (let i = 0; i < nhCount; i++) {
+    rows.push({ text: formatOrderRow(state.notHereOrders[i], state.selectedIndex === i), selIdx: i });
+  }
+  if (nhCount > 0 && openCount > 0) {
+    rows.push({ text: `\u2500\u2500 ${openCount} Open \u2500\u2500`, selIdx: null }); // ── X Open ──
+  }
+  for (let i = 0; i < openCount; i++) {
+    const globalIdx = nhCount + i;
+    rows.push({ text: formatOrderRow(state.orders[i], state.selectedIndex === globalIdx), selIdx: globalIdx });
+  }
 
-function buildCountHudText(): string {
-  const tc = trueCount();
-  const adv = advantageEstimate();
-  const cheatLine = 'CLICK(+1):2-6  DOWN(0):7-9  UP(-1):10-A';
+  // Window: 8 visible rows, keep selected row visible
+  const WIN = 8;
+  const selDisplayRow = rows.findIndex(r => r.selIdx === state.selectedIndex);
+  let winStart = selDisplayRow >= 0 ? Math.max(0, selDisplayRow - 3) : 0;
+  const winEnd = Math.min(rows.length, winStart + WIN);
+  winStart = Math.max(0, winEnd - WIN);
 
-  const lines = [
-    `DECKS: ${decksRemaining().toFixed(2)}     |     RC: ${state.runningCount >= 0 ? '+' : ''}${state.runningCount}     |     TC: ${signedRounded(tc, 1)}     |     EDGE: ${signedRounded(adv, 1)}%`,
-    recommendation(),
-    state.showCheatOnMain?cheatLine:'',
-    '\n\n\n\n\n',
-    'DBL for menu',
-  ];
-
+  const lines: string[] = [headerLine];
+  for (let r = winStart; r < winEnd; r++) lines.push(rows[r].text);
+  while (lines.length <= 8) lines.push('');
+  lines.push('CLICK:Open  DBL:Refresh');
   return lines.join('\n');
 }
 
-function buildMainHudText(): string {
-  const disclaimerRemaining = disclaimerRemainingSeconds();
-  if (!state.disclaimerAccepted && disclaimerRemaining > 0) {
-    return [
-      'TRAINING MODE ONLY',
-      'Casino use may violate',
-      'house rules or state laws',
-      '',
-      `Cooldown ${disclaimerRemaining}s`,
-    ].join('\n');
-  }
-  if (!state.disclaimerAccepted) {
-    return [
-      'TRAINING MODE ONLY',
-      'Casino use may violate',
-      'house rules or state laws',
-      '',
-      'OK (CLICK)',
-    ].join('\n');
-  }
+function formatNotHereWait(id: string): string {
+  const ts = state.notHereAt[id];
+  if (!ts) return '?';
+  return `${Math.floor((Date.now() - ts) / 60000).toString().padStart(2, '0')}m`;
+}
 
-  if (state.hudMode === 'MENU') return buildMenuHudText();
-  if (state.hudMode === 'DECKS') return buildDeckHudText();
-  if (state.hudMode === 'CHEAT') return buildCheatHudText();
-  return buildCountHudText();
+function buildNotHereSummary(): string {
+  const nh = state.notHereOrders;
+  if (nh.length === 0) return '';
+  const parts = nh.map(o => {
+    const name = truncateName(o.customerName, 5);
+    const cnt = o.itemLines.filter(l => !l.startsWith('   ')).length;
+    return `${name}[${cnt}]${formatNotHereWait(o.id)}`;
+  });
+  return `${nh.length} Not Here: ${parts.join(' | ')}`;
+}
+
+function buildOrderDetailHudText(): string {
+  const isNh = isNotHereIdx(state.selectedIndex);
+  const order = getOrderAtIdx(state.selectedIndex);
+  if (!order) return 'No order selected\n\n\n\n\nDBL:Back';
+
+  const wait = formatWaitTime(Date.now() - order.createdAt);
+  const itemCount = order.itemLines.filter(l => !l.startsWith('   ')).length;
+  const nhSummary = buildNotHereSummary();
+  const orderHeader = `${truncateName(order.customerName, 14)}  [${itemCount}]  ${wait}`;
+
+  const lines: string[] = [];
+  if (nhSummary) {
+    lines.push(nhSummary);
+    lines.push('-'.repeat(18));
+  }
+  lines.push(orderHeader);
+  // For not-here orders: replace the separator with a MADE badge so it's obvious the food is ready
+  lines.push(isNh ? '[ MADE \u2014 HAND OFF ]' : '-'.repeat(18));
+
+  const contentLines = [...order.itemLines, ...order.noteLines];
+  const maxItems = nhSummary ? 3 : 5;
+  for (let i = 0; i < Math.min(maxItems, contentLines.length); i++)
+    lines.push(isNh?' *** '+contentLines[i]:contentLines[i]);
+
+  // Pad so the footer always sits at the bottom of the display (9 lines total)
+  while (lines.length <= 8) lines.push('');
+  lines.push(isNh ? 'CLICK:Pickup  DBL:Back' : 'CLICK:Done  DBL:Back');
+  return lines.join('\n');
+}
+
+function buildConfirmHudText(): string {
+  const isNh = isNotHereIdx(state.selectedIndex);
+  const order = getOrderAtIdx(state.selectedIndex);
+  if (!order) return 'No order\n\n\n\n\nDBL:Back';
+
+  const wait = formatWaitTime(Date.now() - order.createdAt);
+  const itemNames = order.itemLines
+    .filter(l => !l.startsWith('   '))
+    .map(l => l.replace(/^\d+ x /, ''))
+    .slice(0, 2);
+  const summary = truncateName(itemNames.join(', '), LINE_WIDTH);
+
+  const opt1 = isNh ? 'PICKED UP' : 'COMPLETE';
+  const opt2 = isNh ? 'STILL AWAY' : 'NOT HERE';
+
+  return [
+    `${truncateName(order.customerName, 14)}  ${wait}`,
+    summary,
+    '-'.repeat(18),
+    state.confirmChoice === 'COMPLETE' ? `> ${opt1}` : `  ${opt1}`,
+    state.confirmChoice === 'NOT_HERE' ? `> ${opt2}` : `  ${opt2}`,
+    '-'.repeat(18),
+    'CLICK:Confirm  DBL:Back',
+  ].join('\n');
+}
+
+function buildMainHudText(): string {
+  if (state.hudMode === 'ORDER_DETAIL') return buildOrderDetailHudText();
+  if (state.hudMode === 'CONFIRM') return buildConfirmHudText();
+  return buildOrdersHudText();
 }
 
 async function pushHudToEvenHub(): Promise<void> {
@@ -269,6 +370,19 @@ async function render(): Promise<void> {
   publishStatus.textContent = state.publishStatus;
   publishBtn.textContent = state.deployed ? 'Update App' : 'Publish App';
 
+  // Update status dot
+  const age = state.lastSync > 0 ? Math.floor((Date.now() - state.lastSync) / 1000) : -1;
+  if (state.syncStatus === 'ERROR' || age > 120) {
+    kdsStatusDot.className = 'kds-status-dot kds-dot-error';
+    kdsStatusDot.title = 'Offline';
+  } else if (age > 30 || state.syncStatus === 'IDLE') {
+    kdsStatusDot.className = 'kds-status-dot kds-dot-warn';
+    kdsStatusDot.title = 'Stale';
+  } else {
+    kdsStatusDot.className = 'kds-status-dot kds-dot-ok';
+    kdsStatusDot.title = 'Connected';
+  }
+
   try {
     await pushHudToEvenHub();
   } catch (error) {
@@ -276,123 +390,198 @@ async function render(): Promise<void> {
   }
 }
 
-function applyCountEvent(type: CountEventType): void {
-  const delta = type === 'LOW' ? 1 : type === 'HIGH' ? -1 : 0;
-  state.runningCount += delta;
-  state.cardsSeen += 1;
-  state.history.push({ type, delta });
-  state.lastAction = `Card: ${type}`;
-}
-
-function undoLastEvent(): void {
-  const last = state.history.pop();
-  if (!last) {
-    state.lastAction = 'Undo: none';
-    return;
+async function completeOrder(id: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const resp = await fetch(`${CONTROL_URL}/square/orders/complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orderId: id }),
+    });
+    const body = await resp.json().catch(() => null) as { ok?: boolean; error?: string } | null;
+    return { ok: !!body?.ok, error: body?.error };
+  } catch (e) {
+    return { ok: false, error: String(e) };
   }
-
-  state.runningCount -= last.delta;
-  state.cardsSeen = Math.max(0, state.cardsSeen - 1);
-  state.lastAction = `Undo: ${last.type}`;
 }
 
-function resetShoe(): void {
-  state.runningCount = 0;
-  state.cardsSeen = 0;
-  state.history = [];
-  state.lastAction = 'New shoe';
-}
-
-function openMenu(): void {
-  state.hudMode = 'MENU';
-  state.menuIndex = 0;
-}
-
-function closeToCount(lastAction: string): void {
-  state.hudMode = 'COUNT';
-  state.lastAction = lastAction;
-}
-
-function cycleMenu(direction: 1 | -1): void {
-  const max = MENU_ITEMS.length;
-  state.menuIndex = (state.menuIndex + direction + max) % max;
-}
-
-function executeMenuAction(): void {
-  const item = MENU_ITEMS[state.menuIndex];
-  if (item === 'Undo Last Card') {
-    undoLastEvent();
-    closeToCount(state.lastAction);
-    return;
+async function prepareOrder(id: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const resp = await fetch(`${CONTROL_URL}/square/orders/prepared`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orderId: id }),
+    });
+    const body = await resp.json().catch(() => null) as { ok?: boolean; error?: string } | null;
+    return { ok: !!body?.ok, error: body?.error };
+  } catch (e) {
+    return { ok: false, error: String(e) };
   }
-  if (item === 'New Shoe') {
-    resetShoe();
-    closeToCount(state.lastAction);
-    return;
-  }
-  if (item === 'Adjust Decks') {
-    state.hudMode = 'DECKS';
-    return;
-  }
-  if (item === 'Cheat Sheet') {
-    state.hudMode = 'CHEAT';
-    return;
-  }
-  closeToCount('Back to count');
 }
 
-function applyDeckAdjust(increment: number): void {
-  state.decksTotal = clampFloat(state.decksTotal + increment, 1, 8);
-  state.lastAction = `Decks set: ${state.decksTotal.toFixed(1)}`;
+async function pollOrders(): Promise<void> {
+  try {
+    const resp = await fetch(`${CONTROL_URL}/square/orders`, { cache: 'no-store' });
+    if (!resp.ok) {
+      state.syncStatus = 'ERROR';
+      return;
+    }
+    const body = await resp.json() as {
+      orders?: KdsOrder[];
+      fetchedAt?: number;
+      syncStatus?: 'OK' | 'POLLING' | 'ERROR' | 'IDLE';
+    };
+
+    const incoming: KdsOrder[] = body.orders ?? [];
+    state.lastSync = body.fetchedAt ?? Date.now();
+    state.syncStatus = body.syncStatus ?? 'OK';
+
+    // Prune pending completions older than 30s (Square should have confirmed by then)
+    const now = Date.now();
+    for (const [id, ts] of pendingCompleteIds) {
+      if (now - ts > 30000) pendingCompleteIds.delete(id);
+    }
+
+    // Auto-promote PREPARED orders into not-here (persists across glass restarts)
+    for (const o of incoming) {
+      if (o.fulfillmentState === 'PREPARED' && !state.notHereAt[o.id] && !pendingCompleteIds.has(o.id)) {
+        if (!state.notHereOrders.find(n => n.id === o.id)) {
+          state.notHereOrders = [...state.notHereOrders, o];
+        }
+        state.notHereAt[o.id] = state.notHereAt[o.id] ?? Date.now();
+      }
+    }
+
+    // Keep not-here orders in sync — remove any that no longer exist in Square
+    const incomingIds = new Set(incoming.map(o => o.id));
+    state.notHereOrders = state.notHereOrders.filter(o => incomingIds.has(o.id));
+    for (const id of Object.keys(state.notHereAt)) {
+      if (!incomingIds.has(id)) delete state.notHereAt[id];
+    }
+
+    // Main list excludes not-here orders (PREPARED) and orders we just completed (grace period)
+    const notHereIds = new Set(state.notHereOrders.map(o => o.id));
+    const mainOrders = incoming.filter(o => !notHereIds.has(o.id) && !pendingCompleteIds.has(o.id));
+    const mainSig = mainOrders.map(o => `${o.id}:${o.state}`).join(',');
+    const prevMainSig = state.orders.map(o => `${o.id}:${o.state}`).join(',');
+
+    if (mainSig !== prevMainSig) {
+      const prevLen = state.orders.length;
+      state.orders = mainOrders;
+      const newTotal = state.notHereOrders.length + mainOrders.length;
+      state.selectedIndex = Math.min(state.selectedIndex, Math.max(0, newTotal - 1));
+      if (mainOrders.length > prevLen) state.lastAction = 'New order!';
+      await render();
+    }
+  } catch {
+    state.syncStatus = 'ERROR';
+  }
 }
 
 async function applyAction(action: InputAction): Promise<void> {
-  if (!state.disclaimerAccepted && disclaimerRemainingSeconds() > 0) {
-    state.lastAction = 'Disclaimer cooldown active';
-    await render();
-    return;
-  }
-  if (!state.disclaimerAccepted) {
-    if (action === 'CLICK') {
-      state.disclaimerAccepted = true;
-      state.lastAction = 'Disclaimer accepted';
-    } else {
-      state.lastAction = 'Press click to continue';
+  if (state.hudMode === 'ORDERS') {
+    const max = Math.max(0, state.orders.length + state.notHereOrders.length - 1);
+    if (action === 'UP') state.selectedIndex = Math.max(0, state.selectedIndex - 1);
+    if (action === 'DOWN') state.selectedIndex = Math.min(max, state.selectedIndex + 1);
+    if (action === 'CLICK' && getOrderAtIdx(state.selectedIndex)) {
+      state.hudMode = 'ORDER_DETAIL';
+    }
+    if (action === 'DOUBLE_CLICK') {
+      state.lastAction = 'Refreshing...';
+      await render();
+      await fetch(`${CONTROL_URL}/square/refresh`, { method: 'POST' }).catch(() => null);
+      await pollOrders();
     }
     await render();
     return;
   }
 
-  if (state.hudMode === 'COUNT') {
-    if (action === 'CLICK') applyCountEvent('LOW');
-    if (action === 'UP') applyCountEvent('HIGH');
-    if (action === 'DOWN') applyCountEvent('NEUTRAL');
-    if (action === 'DOUBLE_CLICK') openMenu();
+  if (state.hudMode === 'ORDER_DETAIL') {
+    const max = Math.max(0, state.orders.length + state.notHereOrders.length - 1);
+    if (action === 'UP') state.selectedIndex = Math.max(0, state.selectedIndex - 1);
+    if (action === 'DOWN') state.selectedIndex = Math.min(max, state.selectedIndex + 1);
+    if (action === 'CLICK') {
+      state.hudMode = 'CONFIRM';
+      state.confirmChoice = 'COMPLETE';
+    }
+    if (action === 'DOUBLE_CLICK') state.hudMode = 'ORDERS';
     await render();
     return;
   }
 
-  if (state.hudMode === 'MENU') {
-    if (action === 'UP') cycleMenu(-1);
-    if (action === 'DOWN') cycleMenu(1);
-    if (action === 'CLICK') executeMenuAction();
-    if (action === 'DOUBLE_CLICK') closeToCount('Back to count');
+  if (state.hudMode === 'CONFIRM') {
+    if (action === 'UP') state.confirmChoice = 'COMPLETE';
+    if (action === 'DOWN') state.confirmChoice = 'NOT_HERE';
+    if (action === 'CLICK') {
+      const isNh = isNotHereIdx(state.selectedIndex);
+      const order = getOrderAtIdx(state.selectedIndex);
+      if (order) {
+        if (isNh) {
+          // Not-here order: PICKED UP = complete in Square, STILL AWAY = leave in not-here list
+          if (state.confirmChoice === 'COMPLETE') {
+            state.lastAction = `Completing ${order.displayId}...`;
+            await render();
+            const result = await completeOrder(order.id);
+            if (result.ok) {
+              pendingCompleteIds.set(order.id, Date.now());
+              lastCompletedName = order.customerName;
+              lastCompletedAt = Date.now();
+              state.notHereOrders = state.notHereOrders.filter(o => o.id !== order.id);
+              delete state.notHereAt[order.id];
+              state.lastAction = `Done: ${order.customerName}`;
+            } else {
+              state.lastAction = `Fail: ${result.error ?? 'unknown'}`;
+              publishLog.textContent = `Complete failed: ${result.error ?? 'unknown'}`;
+            }
+          }
+          // STILL AWAY: do nothing, just go back
+          // Index scheme: nh=0..nhCount-1, open=nhCount..total-1. Clamp to valid range.
+          state.selectedIndex = Math.min(state.selectedIndex, Math.max(0, state.notHereOrders.length + state.orders.length - 1));
+        } else {
+          // Open order: COMPLETE = mark done, NOT HERE = move to not-here queue
+          if (state.confirmChoice === 'COMPLETE') {
+            state.lastAction = `Completing ${order.displayId}...`;
+            await render();
+            const result = await completeOrder(order.id);
+            if (result.ok) {
+              pendingCompleteIds.set(order.id, Date.now());
+              lastCompletedName = order.customerName;
+              lastCompletedAt = Date.now();
+              state.lastAction = `Done: ${order.customerName}`;
+              state.orders = state.orders.filter(o => o.id !== order.id);
+              // Keep selectedIndex pointing at next open order; clamp to valid total range
+              const newTotal = state.notHereOrders.length + state.orders.length;
+              state.selectedIndex = Math.min(state.selectedIndex, Math.max(0, newTotal - 1));
+              // Don't let index fall below start of open range if open orders still exist
+              if (state.orders.length > 0) {
+                state.selectedIndex = Math.max(state.selectedIndex, state.notHereOrders.length);
+              }
+            } else {
+              state.lastAction = `Fail: ${result.error ?? 'unknown'}`;
+              publishLog.textContent = `Complete failed: ${result.error ?? 'unknown'}`;
+            }
+          } else {
+            // NOT HERE: move to not-here list + mark PREPARED in Square
+            state.notHereOrders = [...state.notHereOrders.filter(o => o.id !== order.id), order];
+            state.notHereAt[order.id] = Date.now();
+            state.orders = state.orders.filter(o => o.id !== order.id);
+            // Point at first open order, or last not-here if no open orders remain
+            state.selectedIndex = state.orders.length > 0
+              ? state.notHereOrders.length
+              : Math.max(0, state.notHereOrders.length - 1);
+            state.lastAction = `Not here: ${order.customerName}`;
+            // Fire-and-forget — don't block the UI on this
+            void prepareOrder(order.id);
+          }
+        }
+      }
+      const total = state.orders.length + state.notHereOrders.length;
+      state.hudMode = total > 0 ? 'ORDER_DETAIL' : 'ORDERS';
+    }
+    if (action === 'DOUBLE_CLICK') state.hudMode = 'ORDER_DETAIL';
     await render();
     return;
   }
 
-  if (state.hudMode === 'DECKS') {
-    if (action === 'UP') applyDeckAdjust(0.5);
-    if (action === 'DOWN') applyDeckAdjust(-0.5);
-    if (action === 'CLICK' || action === 'DOUBLE_CLICK') closeToCount(state.lastAction);
-    decksTotalInput.value = String(state.decksTotal);
-    await render();
-    return;
-  }
-
-  if (action === 'CLICK' || action === 'DOUBLE_CLICK') {
-    closeToCount('Back to count');
-  }
   await render();
 }
 
@@ -524,7 +713,7 @@ async function publishApp(): Promise<void> {
     | null;
 
   const savedRepoName = (configBody?.config?.github?.repo ?? '').trim();
-  const defaultAppName = clampAppName(savedRepoName || configBody?.config?.appName || 'even-g2-blackjack');
+  const defaultAppName = clampAppName(savedRepoName || configBody?.config?.appName || 'square-kds');
   let appName = defaultAppName;
 
   if (!savedRepoName) {
@@ -605,7 +794,7 @@ async function buildEhpk(): Promise<void> {
 
   const configResponse = await fetch(`${CONTROL_URL}/config`, { cache: 'no-store' }).catch(() => null);
   const configBody = (await configResponse?.json().catch(() => null)) as { config?: { appName?: string } } | null;
-  const defaultAppName = clampAppName((configBody?.config?.appName ?? 'even-g2-blackjack').trim() || 'even-g2-blackjack');
+  const defaultAppName = clampAppName((configBody?.config?.appName ?? 'square-kds').trim() || 'square-kds');
 
   const appNameInput = window.prompt(`App name for .ehpk package (max ${MAX_APP_NAME_LENGTH} chars):`, defaultAppName);
   const appName = clampAppName(appNameInput ?? '');
@@ -672,23 +861,94 @@ function setKeyboardFallback(): void {
 }
 
 async function init(): Promise<void> {
-  startupMs = Date.now();
   setKeyboardFallback();
 
   publishBtn.addEventListener('click', () => void publishApp());
   ehpkBtn.addEventListener('click', () => void buildEhpk());
 
-  decksTotalInput.addEventListener('change', () => {
-    state.decksTotal = clampFloat(Number(decksTotalInput.value), 1, 8);
-    decksTotalInput.value = String(state.decksTotal);
-    state.lastAction = `Decks set: ${state.decksTotal.toFixed(1)}`;
-    void render();
+  testOrderBtn.addEventListener('click', async () => {
+    testOrderBtn.disabled = true;
+    testOrderBtn.textContent = 'Creating...';
+    try {
+      const resp = await fetch(`${CONTROL_URL}/square/create-test-order`, { method: 'POST' });
+      const body = await resp.json().catch(() => null) as { ok?: boolean; customerName?: string; error?: string } | null;
+      if (body?.ok) {
+        publishLog.textContent = `Test order created for ${body.customerName ?? 'unknown'}.`;
+        await pollOrders();
+      } else {
+        publishLog.textContent = `Test order failed: ${body?.error ?? 'unknown'}`;
+      }
+    } catch (e) {
+      publishLog.textContent = `Test order error: ${String(e)}`;
+    } finally {
+      testOrderBtn.disabled = false;
+      testOrderBtn.textContent = '+ Test Order';
+    }
   });
-  showCheatMainInput.checked = state.showCheatOnMain;
-  showCheatMainInput.addEventListener('change', () => {
-    state.showCheatOnMain = showCheatMainInput.checked;
-    state.lastAction = state.showCheatOnMain ? 'Main cheat: on' : 'Main cheat: off';
-    void render();
+
+  clearOrdersBtn.addEventListener('click', async () => {
+    clearOrdersBtn.disabled = true;
+    clearOrdersBtn.textContent = 'Clearing...';
+    try {
+      const resp = await fetch(`${CONTROL_URL}/square/clear-orders`, { method: 'POST' });
+      const body = await resp.json().catch(() => null) as { ok?: boolean; deleted?: number; failed?: number; error?: string } | null;
+      if (body?.ok) {
+        state.orders = [];
+        state.notHereOrders = [];
+        state.notHereAt = {};
+        state.selectedIndex = 0;
+        state.hudMode = 'ORDERS';
+        publishLog.textContent = `Cleared ${body.deleted ?? 0} orders${body.failed ? `, ${body.failed} failed` : ''}.`;
+        await render();
+      } else {
+        publishLog.textContent = `Clear failed: ${body?.error ?? 'unknown'}`;
+      }
+    } catch (e) {
+      publishLog.textContent = `Clear error: ${String(e)}`;
+    } finally {
+      clearOrdersBtn.disabled = false;
+      clearOrdersBtn.textContent = 'Clear All Orders';
+    }
+  });
+
+  const urgentMinsInput = document.querySelector<HTMLInputElement>('#urgent-mins')!;
+  urgentMinsInput.addEventListener('change', () => {
+    const v = parseInt(urgentMinsInput.value, 10);
+    if (v >= 1 && v <= 60) urgentMinutes = v;
+  });
+
+  squareSaveBtn.addEventListener('click', async () => {
+    const accessToken = squareTokenInput.value.trim();
+    const locationId = squareLocationInput.value.trim();
+    const environment = squareEnvSelect.value;
+
+    if (!accessToken || !locationId) {
+      squareStatusText.textContent = 'Token and Location ID required.';
+      return;
+    }
+
+    squareSaveBtn.disabled = true;
+    squareStatusText.textContent = 'Saving...';
+
+    try {
+      const resp = await fetch(`${CONTROL_URL}/square/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accessToken, locationId, environment }),
+      });
+      const body = await resp.json().catch(() => null) as { ok?: boolean; error?: string } | null;
+      if (body?.ok) {
+        squareStatusText.textContent = 'Saved. Connecting...';
+        await pollOrders();
+        squareStatusText.textContent = `Connected. ${state.orders.length} open orders.`;
+      } else {
+        squareStatusText.textContent = `Error: ${body?.error ?? 'Unknown'}`;
+      }
+    } catch (err) {
+      squareStatusText.textContent = `Error: ${String(err)}`;
+    } finally {
+      squareSaveBtn.disabled = false;
+    }
   });
 
   try {
@@ -705,8 +965,24 @@ async function init(): Promise<void> {
 
   try {
     const response = await fetch(`${CONTROL_URL}/config`, { cache: 'no-store' });
-    const body = (await response.json().catch(() => null)) as { config?: { git?: { deployed?: boolean } } } | null;
+    const body = (await response.json().catch(() => null)) as {
+      config?: {
+        git?: { deployed?: boolean };
+        square?: { configured?: boolean; environment?: string; locationId?: string };
+      };
+    } | null;
     state.deployed = !!body?.config?.git?.deployed;
+
+    // Pre-fill Square config form from saved values
+    if (body?.config?.square?.locationId) {
+      squareLocationInput.value = body.config.square.locationId;
+    }
+    if (body?.config?.square?.environment) {
+      squareEnvSelect.value = body.config.square.environment;
+    }
+    if (body?.config?.square?.configured) {
+      squareStatusText.textContent = 'Credentials saved. Polling...';
+    }
   } catch {}
 
   try {
@@ -754,11 +1030,11 @@ async function init(): Promise<void> {
     console.warn('Even bridge not ready, using browser fallback mode:', error);
   }
 
-  window.setInterval(() => {
-    if (!state.disclaimerAccepted) {
-      void render();
-    }
-  }, 250);
+  // Start order polling (fetch from server every 5s)
+  await pollOrders();
+  window.setInterval(() => { void pollOrders(); }, 5000);
+  // Re-render every second — advances wait times and not-here pan
+  window.setInterval(() => { nhPanOffset++; void render(); }, 1000);
 
   await render();
 }

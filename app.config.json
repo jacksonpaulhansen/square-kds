@@ -1,16 +1,16 @@
 {
   "github": {
     "owner": "jacksonpaulhansen",
-    "repo": "even-odds-blackjack",
+    "repo": "square-kds",
     "pat": ""
   },
-  "appName": "even-odds-blackjack",
-  "publishUrl": "https://jacksonpaulhansen.github.io/even-odds-blackjack/",
+  "appName": "square-kds",
+  "publishUrl": "https://jacksonpaulhansen.github.io/square-kds/",
   "git": {
     "enabled": true,
     "userName": "jacksonpaulhansen",
     "userEmail": "270181675+jacksonpaulhansen@users.noreply.github.com",
-    "remoteUrl": "https://github.com/jacksonpaulhansen/even-odds-blackjack.git",
+    "remoteUrl": "https://github.com/jacksonpaulhansen/square-kds.git",
     "branch": "main",
     "commitMessagePrefix": "publish",
     "autoSetGithubPagesUrl": true,
@@ -21,7 +21,7 @@
       }
     ],
     "repos": [
-      "https://github.com/jacksonpaulhansen/even-odds-blackjack.git"
+      "https://github.com/jacksonpaulhansen/square-kds.git"
     ],
     "deployed": false
   }

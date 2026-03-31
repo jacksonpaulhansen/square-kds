@@ -3,6 +3,7 @@ import process from 'node:process';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 
 const host = '127.0.0.1';
 const port = 8787;
@@ -18,6 +19,15 @@ let lastPublish = {
   logs: '',
   at: '',
 };
+
+// Square KDS state
+let squareOrderCache = [];
+let squareCacheAt = 0;
+let squareFetchRunning = false;
+let squarePollInterval = null;
+const SQUARE_POLL_MS = 15000;
+// IDs optimistically suppressed pending Square confirmation (cleared after 30s)
+const pendingSuppressIds = new Map(); // id → timestamp
 
 function sendJson(res, statusCode, payload) {
   const body = JSON.stringify(payload);
@@ -57,6 +67,387 @@ function writeLocalSecrets(secrets) {
   const secretsPath = path.join(projectRoot, '.app.secrets.local.json');
   fs.writeFileSync(secretsPath, `${JSON.stringify(secrets, null, 2)}\n`, 'utf8');
 }
+
+// --- Square KDS helpers ---
+
+function readSquareSecrets() {
+  const secrets = readLocalSecrets();
+  return {
+    accessToken: String(secrets.squareAccessToken || '').trim(),
+    locationId: String(secrets.squareLocationId || '').trim(),
+    environment: String(secrets.squareEnvironment || 'sandbox').trim(),
+  };
+}
+
+function squareApiBase(environment) {
+  return environment === 'production'
+    ? 'https://connect.squareup.com'
+    : 'https://connect.squareupsandbox.com';
+}
+
+function truncateStr(str, maxLen) {
+  const s = String(str || '').trim();
+  if (s.length <= maxLen) return s;
+  return s.slice(0, maxLen - 1) + '\u2026';
+}
+
+function normalizeOrder(o) {
+  // displayId: ticket_name (Square for Restaurants) or last 4 of order ID
+  const ticketName = String(o.ticket_name || '').trim();
+  const displayId = ticketName
+    ? truncateStr(ticketName, 8)
+    : String(o.id || '').slice(-4).toUpperCase();
+
+  // customerName: fulfillment recipient → ticket name → fallback
+  const recipient = o.fulfillments?.[0]?.pickup_details?.recipient?.display_name;
+  const customerName = String(recipient || ticketName || 'Order').trim() || 'Order';
+
+  // itemLines: flat array of pre-formatted display strings
+  const itemLines = [];
+  for (const item of o.line_items || []) {
+    const qty = parseInt(item.quantity || '1', 10);
+    const name = String(item.name || 'Item').trim();
+    itemLines.push(`${qty}x ${name}`);
+    for (const mod of item.modifiers || []) {
+      const modName = String(mod.name || '').trim();
+      if (modName) itemLines.push(`   +${modName}`);
+    }
+    const itemNote = String(item.note || '').trim();
+    if (itemNote) itemLines.push(`   *${itemNote}`);
+  }
+
+  // noteLines: order-level notes (no truncation — let the display wrap)
+  const noteLines = [];
+  const pickupNote = String(o.fulfillments?.[0]?.pickup_details?.note || '').trim();
+  const metaNote = String(o.metadata?.note || '').trim();
+  const orderNote = pickupNote || metaNote;
+  if (orderNote) noteLines.push(`NOTE: ${orderNote}`);
+
+  return {
+    id: String(o.id || ''),
+    displayId,
+    customerName: truncateStr(customerName, 16),
+    itemLines,
+    noteLines,
+    createdAt: o.created_at ? new Date(o.created_at).getTime() : Date.now(),
+    state: String(o.state || 'OPEN'),
+    fulfillmentState: String(o.fulfillments?.[0]?.state || 'PROPOSED'),
+    version: Number(o.version || 0),
+  };
+}
+
+async function fetchSquareOrders() {
+  if (squareFetchRunning) return;
+  const { accessToken, locationId, environment } = readSquareSecrets();
+  if (!accessToken || !locationId) return;
+
+  squareFetchRunning = true;
+  try {
+    const base = squareApiBase(environment);
+    const orders = [];
+    let cursor = undefined;
+
+    do {
+      const body = {
+        location_ids: [locationId],
+        query: {
+          filter: { state_filter: { states: ['OPEN'] } },
+          sort: { sort_field: 'CREATED_AT', sort_order: 'ASC' },
+        },
+        limit: 50,
+      };
+      if (cursor) body.cursor = cursor;
+
+      const resp = await fetch(`${base}/v2/orders/search`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'Square-Version': '2024-11-20',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!resp.ok) {
+        console.error('[square] fetchSquareOrders failed:', resp.status, await resp.text());
+        break;
+      }
+
+      const data = await resp.json();
+      for (const o of data.orders || []) {
+        // Skip orders where every fulfillment is already COMPLETED or CANCELED
+        const fulfillments = o.fulfillments ?? [];
+        const allDone = fulfillments.length > 0 && fulfillments.every(
+          f => f.state === 'COMPLETED' || f.state === 'CANCELED' || f.state === 'FAILED'
+        );
+        if (!allDone) orders.push(normalizeOrder(o));
+      }
+      cursor = data.cursor || null;
+    } while (cursor);
+
+    // Prune stale suppressions (older than 30s)
+    const now = Date.now();
+    for (const [id, ts] of pendingSuppressIds) {
+      if (now - ts > 30000) pendingSuppressIds.delete(id);
+    }
+    // Filter out any IDs we're suppressing (recently cancelled/completed)
+    squareOrderCache = orders.filter(o => !pendingSuppressIds.has(o.id));
+    squareCacheAt = Date.now();
+  } catch (err) {
+    console.error('[square] fetchSquareOrders error:', err);
+  } finally {
+    squareFetchRunning = false;
+  }
+}
+
+async function markOrderComplete(orderId) {
+  const { accessToken, locationId, environment } = readSquareSecrets();
+  if (!accessToken || !locationId) return { ok: false, error: 'Not configured' };
+
+  const base = squareApiBase(environment);
+  const headers = {
+    Authorization: `Bearer ${accessToken}`,
+    'Content-Type': 'application/json',
+    'Square-Version': '2024-11-20',
+  };
+
+  try {
+    // Always fetch the live version — cached version may be stale and Square requires exact match
+    const getResp = await fetch(`${base}/v2/orders/${orderId}`, { method: 'GET', headers });
+    const getData = await getResp.json().catch(() => null);
+    if (!getResp.ok) {
+      console.error('[square] markOrderComplete GET failed:', getResp.status, JSON.stringify(getData));
+      return { ok: false, error: `Could not fetch order: ${getData?.errors?.[0]?.detail || getResp.status}` };
+    }
+    const liveVersion = Number(getData?.order?.version ?? 0);
+    console.log('[square] markOrderComplete fetched version:', liveVersion, 'for order:', orderId);
+
+    // Get the fulfillment UID — we update fulfillment state, not order state.
+    // Fulfillment COMPLETED = food handed off. Order state is set by Square when payment clears.
+    const fulfillments = getData?.order?.fulfillments ?? [];
+    const fulfillmentUid = fulfillments[0]?.uid ?? null;
+
+    const orderUpdate = fulfillmentUid
+      ? {
+          location_id: locationId,
+          version: liveVersion,
+          fulfillments: [{ uid: fulfillmentUid, state: 'COMPLETED' }],
+        }
+      : {
+          // No fulfillment on this order (e.g. sandbox order created via API without one)
+          // Fall back to marking order state directly
+          location_id: locationId,
+          version: liveVersion,
+          state: 'COMPLETED',
+        };
+
+    const putResp = await fetch(`${base}/v2/orders/${orderId}`, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({
+        idempotency_key: crypto.randomUUID(),
+        order: orderUpdate,
+      }),
+    });
+
+    const putData = await putResp.json().catch(() => null);
+    if (!putResp.ok) {
+      const errDetail = putData?.errors?.[0]?.detail || putData?.errors?.[0]?.code || putResp.status;
+      console.error('[square] markOrderComplete PUT failed:', putResp.status, JSON.stringify(putData));
+      return { ok: false, error: String(errDetail) };
+    }
+    console.log('[square] markOrderComplete ok:', orderId);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+async function markOrderPrepared(orderId) {
+  const { accessToken, locationId, environment } = readSquareSecrets();
+  if (!accessToken || !locationId) return { ok: false, error: 'Not configured' };
+
+  const base = squareApiBase(environment);
+  const headers = {
+    Authorization: `Bearer ${accessToken}`,
+    'Content-Type': 'application/json',
+    'Square-Version': '2024-11-20',
+  };
+
+  try {
+    const getResp = await fetch(`${base}/v2/orders/${orderId}`, { method: 'GET', headers });
+    const getData = await getResp.json().catch(() => null);
+    if (!getResp.ok) return { ok: false, error: `Could not fetch order: ${getData?.errors?.[0]?.detail || getResp.status}` };
+
+    const liveVersion = Number(getData?.order?.version ?? 0);
+    const fulfillmentUid = getData?.order?.fulfillments?.[0]?.uid ?? null;
+    if (!fulfillmentUid) return { ok: false, error: 'No fulfillment on order' };
+
+    const putResp = await fetch(`${base}/v2/orders/${orderId}`, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({
+        idempotency_key: crypto.randomUUID(),
+        order: { location_id: locationId, version: liveVersion, fulfillments: [{ uid: fulfillmentUid, state: 'PREPARED' }] },
+      }),
+    });
+    const putData = await putResp.json().catch(() => null);
+    if (!putResp.ok) {
+      const errDetail = putData?.errors?.[0]?.detail || putData?.errors?.[0]?.code || putResp.status;
+      return { ok: false, error: String(errDetail) };
+    }
+    console.log('[square] markOrderPrepared ok:', orderId);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+const TEST_NAMES = [
+  'Emma', 'Liam', 'Olivia', 'Noah', 'Ava', 'Elijah', 'Sophia', 'James',
+  'Isabella', 'Oliver', 'Mia', 'William', 'Charlotte', 'Benjamin', 'Amelia',
+  'Lucas', 'Harper', 'Henry', 'Evelyn', 'Alexander', 'Luna', 'Mason',
+  'Camila', 'Ethan', 'Penelope', 'Daniel', 'Riley', 'Jacob', 'Nora', 'Logan',
+];
+let lastTestNameIndex = -1;
+
+function pickTestName() {
+  let idx;
+  do { idx = Math.floor(Math.random() * TEST_NAMES.length); } while (idx === lastTestNameIndex);
+  lastTestNameIndex = idx;
+  return TEST_NAMES[idx];
+}
+
+async function createTestOrder() {
+  const { accessToken, locationId, environment } = readSquareSecrets();
+  if (!accessToken || !locationId) return { ok: false, error: 'Square not configured' };
+
+  const base = squareApiBase(environment);
+  const headers = {
+    Authorization: `Bearer ${accessToken}`,
+    'Content-Type': 'application/json',
+    'Square-Version': '2024-11-20',
+  };
+
+  // Fetch catalog items
+  const catalogResp = await fetch(`${base}/v2/catalog/list?types=ITEM`, { headers });
+  const catalogData = await catalogResp.json().catch(() => null);
+  const catalogItems = (catalogData?.objects ?? []).filter(o => o.type === 'ITEM' && o.item_data?.variations?.length);
+
+  let lineItems;
+
+  if (catalogItems.length === 0) {
+    // No catalog — use hardcoded donut items
+    lineItems = [
+      {
+        name: 'Mini Donuts',
+        quantity: String(Math.floor(Math.random() * 2) + 1),
+        base_price_money: { amount: 600, currency: 'USD' },
+        note: ['glazed', 'cinnamon sugar', 'powdered sugar', 'chocolate'][Math.floor(Math.random() * 4)],
+      },
+    ];
+  } else {
+    // Pick 1-3 random catalog items and build line items from their variations
+    const shuffled = catalogItems.sort(() => Math.random() - 0.5).slice(0, Math.floor(Math.random() * 3) + 1);
+    lineItems = shuffled.map(item => {
+      const variations = item.item_data.variations;
+      const variation = variations[Math.floor(Math.random() * variations.length)];
+      const price = variation.item_variation_data?.price_money?.amount ?? 500;
+      const qty = Math.floor(Math.random() * 2) + 1;
+
+      const entry = {
+        catalog_object_id: variation.id,
+        quantity: String(qty),
+        base_price_money: { amount: price, currency: 'USD' },
+      };
+
+      // Optionally add a modifier if the item has modifier lists
+      const modifierListIds = item.item_data?.modifier_list_info?.map(m => m.modifier_list_id) ?? [];
+      if (modifierListIds.length > 0) {
+        // We'll add a note instead since fetching modifier objects requires another call
+        entry.note = 'extra toppings please';
+      }
+      return entry;
+    });
+  }
+
+  const totalAmount = lineItems.reduce((sum, li) => {
+    const price = li.base_price_money?.amount ?? 0;
+    return sum + price * Number(li.quantity ?? 1);
+  }, 0);
+
+  const customerName = pickTestName();
+
+  // Create order with a PICKUP fulfillment so it shows up in KDS properly
+  const orderResp = await fetch(`${base}/v2/orders`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      idempotency_key: crypto.randomUUID(),
+      order: {
+        location_id: locationId,
+        ticket_name: customerName,
+        line_items: lineItems,
+        fulfillments: [{
+          type: 'PICKUP',
+          state: 'PROPOSED',
+          pickup_details: {
+            recipient: { display_name: customerName },
+            schedule_type: 'ASAP',
+            note: Math.random() > 0.6 ? 'nut allergy' : undefined,
+          },
+        }],
+      },
+    }),
+  });
+
+  const orderData = await orderResp.json().catch(() => null);
+  if (!orderResp.ok) {
+    console.error('[square] createTestOrder order failed:', JSON.stringify(orderData));
+    return { ok: false, error: orderData?.errors?.[0]?.detail ?? String(orderResp.status) };
+  }
+
+  const orderId = orderData.order.id;
+  const orderVersion = orderData.order.version;
+  console.log('[square] createTestOrder created order:', orderId, 'for', customerName);
+
+  // Pay with cash so the order has a payment and can be completed
+  const payResp = await fetch(`${base}/v2/payments`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      idempotency_key: crypto.randomUUID(),
+      source_id: 'CASH',
+      amount_money: { amount: totalAmount, currency: 'USD' },
+      cash_details: {
+        buyer_supplied_money: { amount: totalAmount, currency: 'USD' },
+      },
+      order_id: orderId,
+      location_id: locationId,
+    }),
+  });
+
+  const payData = await payResp.json().catch(() => null);
+  if (!payResp.ok) {
+    console.error('[square] createTestOrder payment failed:', JSON.stringify(payData));
+    return { ok: false, error: `Order created but payment failed: ${payData?.errors?.[0]?.detail ?? payResp.status}` };
+  }
+
+  console.log('[square] createTestOrder payment ok for order:', orderId);
+
+  // Refresh cache so the new order appears immediately
+  void fetchSquareOrders();
+
+  return { ok: true, orderId, customerName, totalAmount, lineItemCount: lineItems.length };
+}
+
+function startSquarePoll() {
+  if (squarePollInterval) clearInterval(squarePollInterval);
+  squarePollInterval = setInterval(() => { void fetchSquareOrders(); }, SQUARE_POLL_MS);
+  void fetchSquareOrders();
+}
+
+// --- end Square KDS helpers ---
 
 function runGit(args) {
   return new Promise((resolve, reject) => {
@@ -674,7 +1065,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: 'control-server',
       version: apiVersion,
-      capabilities: ['publish', 'publish-app', 'reboot', 'link-git', 'switch-git-account', 'build-ehpk'],
+      capabilities: ['publish', 'publish-app', 'reboot', 'link-git', 'switch-git-account', 'build-ehpk', 'square-kds'],
     });
     return;
   }
@@ -694,6 +1085,11 @@ const server = http.createServer(async (req, res) => {
             hasPat: !!String(secrets.githubPat ?? '').trim(),
           },
           git: config.git ?? {},
+          square: {
+            configured: !!String(secrets.squareAccessToken || '').trim(),
+            environment: String(secrets.squareEnvironment || 'sandbox'),
+            locationId: String(secrets.squareLocationId || ''),
+          },
         },
       });
     } catch (error) {
@@ -966,9 +1362,150 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && req.url === '/square/orders') {
+    sendJson(res, 200, {
+      ok: true,
+      orders: squareOrderCache,
+      fetchedAt: squareCacheAt,
+      syncStatus: squareFetchRunning ? 'POLLING' : (squareCacheAt > 0 ? 'OK' : 'IDLE'),
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/square/orders/complete') {
+    let body = '';
+    req.on('data', (chunk) => { body += String(chunk); });
+    req.on('end', async () => {
+      try {
+        const payload = body ? JSON.parse(body) : {};
+        const orderId = String(payload.orderId || '').trim();
+        if (!orderId) {
+          sendJson(res, 400, { ok: false, error: 'orderId required' });
+          return;
+        }
+        const result = await markOrderComplete(orderId);
+        if (result.ok) {
+          pendingSuppressIds.set(orderId, Date.now());
+          squareOrderCache = squareOrderCache.filter((o) => o.id !== orderId);
+          void fetchSquareOrders();
+        }
+        sendJson(res, result.ok ? 200 : 500, result);
+      } catch (error) {
+        sendJson(res, 500, { ok: false, error: String(error) });
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/square/orders/prepared') {
+    let body = '';
+    req.on('data', (chunk) => { body += String(chunk); });
+    req.on('end', async () => {
+      try {
+        const payload = body ? JSON.parse(body) : {};
+        const orderId = String(payload.orderId || '').trim();
+        if (!orderId) {
+          sendJson(res, 400, { ok: false, error: 'orderId required' });
+          return;
+        }
+        const result = await markOrderPrepared(orderId);
+        if (result.ok) void fetchSquareOrders();
+        sendJson(res, result.ok ? 200 : 500, result);
+      } catch (error) {
+        sendJson(res, 500, { ok: false, error: String(error) });
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/square/refresh') {
+    await fetchSquareOrders();
+    sendJson(res, 200, { ok: true, count: squareOrderCache.length, fetchedAt: squareCacheAt });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/square/config') {
+    let body = '';
+    req.on('data', (chunk) => { body += String(chunk); });
+    req.on('end', () => {
+      try {
+        const payload = body ? JSON.parse(body) : {};
+        const secrets = readLocalSecrets();
+        if (payload.accessToken !== undefined) secrets.squareAccessToken = String(payload.accessToken).trim();
+        if (payload.locationId !== undefined) secrets.squareLocationId = String(payload.locationId).trim();
+        if (payload.environment !== undefined) secrets.squareEnvironment = String(payload.environment).trim();
+        writeLocalSecrets(secrets);
+        startSquarePoll();
+        sendJson(res, 200, { ok: true });
+      } catch (error) {
+        sendJson(res, 500, { ok: false, error: String(error) });
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/square/clear-orders') {
+    try {
+      const { accessToken, locationId } = readSquareSecrets();
+      if (!accessToken || !locationId) {
+        sendJson(res, 400, { ok: false, error: 'Square not configured' });
+        return;
+      }
+
+      let deleted = 0;
+      let failed = 0;
+      const snapshot = [...squareOrderCache];
+      for (const order of snapshot) {
+        try {
+          const result = await markOrderComplete(order.id);
+          if (result.ok) { deleted++; pendingSuppressIds.set(order.id, Date.now()); } else { failed++; }
+        } catch { failed++; }
+      }
+
+      squareOrderCache = [];
+      squareCacheAt = Date.now();
+      void fetchSquareOrders();
+      sendJson(res, 200, { ok: true, deleted, failed });
+    } catch (error) {
+      sendJson(res, 500, { ok: false, error: String(error) });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/square/create-test-order') {
+    try {
+      const result = await createTestOrder();
+      sendJson(res, result.ok ? 200 : 500, result);
+    } catch (error) {
+      sendJson(res, 500, { ok: false, error: String(error) });
+    }
+    return;
+  }
+
+  if (req.method === 'GET' && req.url === '/square/status') {
+    const { accessToken, locationId, environment } = readSquareSecrets();
+    sendJson(res, 200, {
+      ok: true,
+      configured: !!(accessToken && locationId),
+      lastFetchAt: squareCacheAt,
+      orderCount: squareOrderCache.length,
+      environment,
+      fetchRunning: squareFetchRunning,
+    });
+    return;
+  }
+
   sendJson(res, 404, { ok: false, error: 'Not found' });
 });
 
 server.listen(port, host, () => {
   console.log(`[control] listening on http://${host}:${port}`);
 });
+
+// Start Square polling if credentials are already saved
+{
+  const bootSecrets = readLocalSecrets();
+  if (bootSecrets.squareAccessToken && bootSecrets.squareLocationId) {
+    startSquarePoll();
+  }
+}
