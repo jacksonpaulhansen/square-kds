@@ -1,4 +1,5 @@
 import { defineConfig } from 'vite';
+import { resolve } from 'path';
 
 export default defineConfig(({ mode }) => {
   // For GitHub Pages project sites, assets must use /<repo>/ as base.
@@ -7,6 +8,14 @@ export default defineConfig(({ mode }) => {
       ? (process.env.GITHUB_PAGES_BASE || '/')
       : '/';
 
-  return { base };
+  return {
+    base,
+    build: {
+      rollupOptions: {
+        input: {
+          main: resolve(__dirname, 'index.html'),
+        },
+      },
+    },
+  };
 });
-

@@ -26,6 +26,22 @@ let squareCacheAt = 0;
 let squareFetchRunning = false;
 let squarePollInterval = null;
 const SQUARE_POLL_MS = 15000;
+// Rolling avg wait: updated live each time an order is completed
+const completionSamples = []; // last 10 { waitMs } entries, newest last
+let defaultAvgWaitMs = 154 * 1000; // 2m 34s — configurable via browser UI
+
+function recordCompletion(order) {
+  if (!order?.createdAt) return;
+  const waitMs = Date.now() - order.createdAt;
+  if (waitMs <= 0) return;
+  completionSamples.push(waitMs);
+  if (completionSamples.length > 10) completionSamples.shift();
+}
+
+function computeAvgWaitMs() {
+  if (completionSamples.length === 0) return null;
+  return Math.round(completionSamples.reduce((a, b) => a + b, 0) / completionSamples.length);
+}
 // IDs optimistically suppressed pending Square confirmation (cleared after 30s)
 const pendingSuppressIds = new Map(); // id → timestamp
 
@@ -200,6 +216,41 @@ async function fetchSquareOrders() {
   }
 }
 
+async function listSquareLocations(accessToken, environment) {
+  const token = String(accessToken || '').trim();
+  const env = String(environment || 'sandbox').trim() || 'sandbox';
+  if (!token) return { ok: false, error: 'accessToken required' };
+
+  try {
+    const base = squareApiBase(env);
+    const resp = await fetch(`${base}/v2/locations`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'Square-Version': '2024-11-20',
+      },
+    });
+
+    const body = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      const detail = body?.errors?.[0]?.detail || `HTTP ${resp.status}`;
+      return { ok: false, error: detail, status: resp.status, body };
+    }
+
+    const locations = Array.isArray(body?.locations) ? body.locations : [];
+    const normalized = locations.map((loc) => ({
+      id: String(loc?.id || '').trim(),
+      name: String(loc?.name || loc?.business_name || 'Unnamed Location').trim(),
+      status: String(loc?.status || ''),
+    })).filter((loc) => !!loc.id);
+
+    return { ok: true, locations: normalized };
+  } catch (error) {
+    return { ok: false, error: String(error) };
+  }
+}
+
 async function markOrderComplete(orderId) {
   const { accessToken, locationId, environment } = readSquareSecrets();
   if (!accessToken || !locationId) return { ok: false, error: 'Not configured' };
@@ -257,6 +308,9 @@ async function markOrderComplete(orderId) {
       return { ok: false, error: String(errDetail) };
     }
     console.log('[square] markOrderComplete ok:', orderId);
+    // Record the wait time for rolling avg (use cached order to get createdAt)
+    const cached = squareOrderCache.find(o => o.id === orderId);
+    recordCompletion(cached);
     return { ok: true };
   } catch (err) {
     return { ok: false, error: String(err) };
@@ -297,6 +351,9 @@ async function markOrderPrepared(orderId) {
       return { ok: false, error: String(errDetail) };
     }
     console.log('[square] markOrderPrepared ok:', orderId);
+    // Record createdAt→preparedAt as the wait sample for not-here orders
+    const cached = squareOrderCache.find(o => o.id === orderId);
+    recordCompletion(cached);
     return { ok: true };
   } catch (err) {
     return { ok: false, error: String(err) };
@@ -1089,6 +1146,7 @@ const server = http.createServer(async (req, res) => {
             configured: !!String(secrets.squareAccessToken || '').trim(),
             environment: String(secrets.squareEnvironment || 'sandbox'),
             locationId: String(secrets.squareLocationId || ''),
+            defaultAvgWaitMs,
           },
         },
       });
@@ -1363,11 +1421,14 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && req.url === '/square/orders') {
+    const liveAvg = computeAvgWaitMs();
     sendJson(res, 200, {
       ok: true,
       orders: squareOrderCache,
       fetchedAt: squareCacheAt,
       syncStatus: squareFetchRunning ? 'POLLING' : (squareCacheAt > 0 ? 'OK' : 'IDLE'),
+      avgWaitMs: liveAvg ?? defaultAvgWaitMs,
+      avgWaitSampleCount: completionSamples.length,
     });
     return;
   }
@@ -1424,6 +1485,22 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'POST' && req.url === '/square/config/avg-wait') {
+    let body = '';
+    req.on('data', (chunk) => { body += String(chunk); });
+    req.on('end', () => {
+      try {
+        const payload = body ? JSON.parse(body) : {};
+        const secs = Number(payload.defaultAvgWaitSec ?? 0);
+        if (secs >= 0) defaultAvgWaitMs = secs * 1000;
+        sendJson(res, 200, { ok: true, defaultAvgWaitMs });
+      } catch (error) {
+        sendJson(res, 500, { ok: false, error: String(error) });
+      }
+    });
+    return;
+  }
+
   if (req.method === 'POST' && req.url === '/square/config') {
     let body = '';
     req.on('data', (chunk) => { body += String(chunk); });
@@ -1437,6 +1514,28 @@ const server = http.createServer(async (req, res) => {
         writeLocalSecrets(secrets);
         startSquarePoll();
         sendJson(res, 200, { ok: true });
+      } catch (error) {
+        sendJson(res, 500, { ok: false, error: String(error) });
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/square/locations') {
+    let body = '';
+    req.on('data', (chunk) => { body += String(chunk); });
+    req.on('end', async () => {
+      try {
+        const payload = body ? JSON.parse(body) : {};
+        const saved = readSquareSecrets();
+        const accessToken = saved.accessToken;
+        const environment = String(payload.environment ?? saved.environment ?? 'sandbox').trim() || 'sandbox';
+        if (!accessToken) {
+          sendJson(res, 500, { ok: false, error: 'Missing squareAccessToken in local secrets' });
+          return;
+        }
+        const result = await listSquareLocations(accessToken, environment);
+        sendJson(res, result.ok ? 200 : 500, result);
       } catch (error) {
         sendJson(res, 500, { ok: false, error: String(error) });
       }

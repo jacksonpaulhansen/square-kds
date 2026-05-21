@@ -91,28 +91,24 @@ app.innerHTML = `
     <fieldset class="group-box">
       <legend>Square KDS Config</legend>
       <div class="settings-row">
-        <div class="mini-field wide-field">
-          <label for="square-token">Access Token</label>
-          <input id="square-token" type="password" placeholder="EAAAl..." autocomplete="off" />
-        </div>
         <span id="kds-status-dot" class="kds-status-dot kds-dot-idle" title="Not configured"></span>
       </div>
       <div class="settings-row">
         <div class="mini-field wide-field">
-          <label for="square-location">Location ID</label>
-          <input id="square-location" type="text" placeholder="L..." />
-        </div>
-      </div>
-      <div class="settings-row">
-        <div class="mini-field">
-          <label for="square-env">Environment</label>
-          <select id="square-env">
-            <option value="sandbox">Sandbox</option>
-            <option value="production">Production</option>
+          <label for="square-location">Location</label>
+          <select id="square-location">
+            <option value="">Load locations first</option>
           </select>
         </div>
       </div>
       <div class="settings-row">
+        <div class="mini-field">
+          <label for="default-wait-seconds">Default Avg Wait (seconds)</label>
+          <input id="default-wait-seconds" type="number" min="0" step="1" value="154" />
+        </div>
+      </div>
+      <div class="settings-row">
+        <button id="load-locations-btn" type="button">Load Locations</button>
         <button id="square-save-btn" type="button">Save &amp; Connect</button>
         <span id="square-status-text" class="hint" style="margin:0;"></span>
       </div>
@@ -156,9 +152,9 @@ const clearOrdersBtn = document.querySelector<HTMLButtonElement>('#clear-orders-
 const publishStatus = document.querySelector<HTMLSpanElement>('#publish-status')!;
 const eventLog = document.querySelector<HTMLPreElement>('#event-log')!;
 const publishLog = document.querySelector<HTMLPreElement>('#publish-log')!;
-const squareTokenInput = document.querySelector<HTMLInputElement>('#square-token')!;
-const squareLocationInput = document.querySelector<HTMLInputElement>('#square-location')!;
-const squareEnvSelect = document.querySelector<HTMLSelectElement>('#square-env')!;
+const squareLocationInput = document.querySelector<HTMLSelectElement>('#square-location')!;
+const defaultWaitInput = document.querySelector<HTMLInputElement>('#default-wait-seconds')!;
+const loadLocationsBtn = document.querySelector<HTMLButtonElement>('#load-locations-btn')!;
 const squareSaveBtn = document.querySelector<HTMLButtonElement>('#square-save-btn')!;
 const squareStatusText = document.querySelector<HTMLSpanElement>('#square-status-text')!;
 const kdsStatusDot = document.querySelector<HTMLSpanElement>('#kds-status-dot')!;
@@ -860,6 +856,28 @@ function setKeyboardFallback(): void {
   });
 }
 
+function renderLocationOptions(
+  locations: Array<{ id?: string; name?: string; status?: string }>,
+  selectedId: string,
+): void {
+  const safeLocations = Array.isArray(locations) ? locations : [];
+  if (!safeLocations.length) {
+    squareLocationInput.innerHTML = '<option value="">No locations found</option>';
+    return;
+  }
+  squareLocationInput.innerHTML = safeLocations
+    .filter((loc) => String(loc?.id || '').trim())
+    .map((loc) => {
+      const id = String(loc?.id || '').trim();
+      const name = String(loc?.name || 'Location').trim();
+      const status = String(loc?.status || '').trim();
+      const active = status ? ` (${status})` : '';
+      const selected = id === selectedId ? ' selected' : '';
+      return `<option value="${id}"${selected}>${name}${active}</option>`;
+    })
+    .join('');
+}
+
 async function init(): Promise<void> {
   setKeyboardFallback();
 
@@ -917,33 +935,73 @@ async function init(): Promise<void> {
     if (v >= 1 && v <= 60) urgentMinutes = v;
   });
 
-  squareSaveBtn.addEventListener('click', async () => {
-    const accessToken = squareTokenInput.value.trim();
-    const locationId = squareLocationInput.value.trim();
-    const environment = squareEnvSelect.value;
+  loadLocationsBtn.addEventListener('click', async () => {
+    loadLocationsBtn.disabled = true;
+    squareStatusText.textContent = 'Loading locations...';
+    try {
+      const resp = await fetch(`${CONTROL_URL}/square/locations`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const body = await resp.json().catch(() => null) as {
+        ok?: boolean;
+        error?: string;
+        locations?: Array<{ id?: string; name?: string; status?: string }>;
+      } | null;
+      if (!resp.ok || !body?.ok) {
+        squareStatusText.textContent = `Error: ${body?.error ?? 'Failed to load locations'}`;
+        return;
+      }
+      const locations = Array.isArray(body.locations) ? body.locations : [];
+      const selectedId = String(squareLocationInput.value || '').trim() || String(locations[0]?.id || '');
+      renderLocationOptions(locations, selectedId);
+      squareStatusText.textContent = locations.length
+        ? `Loaded ${locations.length} location${locations.length === 1 ? '' : 's'}.`
+        : 'No locations found.';
+    } catch (err) {
+      squareStatusText.textContent = `Error: ${String(err)}`;
+    } finally {
+      loadLocationsBtn.disabled = false;
+    }
+  });
 
-    if (!accessToken || !locationId) {
-      squareStatusText.textContent = 'Token and Location ID required.';
+  squareSaveBtn.addEventListener('click', async () => {
+    const locationId = String(squareLocationInput.value || '').trim();
+    const defaultAvgWaitSec = Math.max(0, Math.floor(Number(defaultWaitInput.value || 0)));
+    if (!locationId) {
+      squareStatusText.textContent = 'Select a location first.';
       return;
     }
 
     squareSaveBtn.disabled = true;
     squareStatusText.textContent = 'Saving...';
-
     try {
-      const resp = await fetch(`${CONTROL_URL}/square/config`, {
+      const saveConfigResp = await fetch(`${CONTROL_URL}/square/config`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accessToken, locationId, environment }),
+        body: JSON.stringify({ locationId }),
       });
-      const body = await resp.json().catch(() => null) as { ok?: boolean; error?: string } | null;
-      if (body?.ok) {
-        squareStatusText.textContent = 'Saved. Connecting...';
-        await pollOrders();
-        squareStatusText.textContent = `Connected. ${state.orders.length} open orders.`;
-      } else {
-        squareStatusText.textContent = `Error: ${body?.error ?? 'Unknown'}`;
+      const saveConfigBody = await saveConfigResp.json().catch(() => null) as { ok?: boolean; error?: string } | null;
+      if (!saveConfigResp.ok || !saveConfigBody?.ok) {
+        squareStatusText.textContent = `Error: ${saveConfigBody?.error ?? 'Failed saving location'}`;
+        return;
       }
+
+      const saveWaitResp = await fetch(`${CONTROL_URL}/square/config/avg-wait`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ defaultAvgWaitSec }),
+      });
+      const saveWaitBody = await saveWaitResp.json().catch(() => null) as { ok?: boolean; error?: string } | null;
+      if (!saveWaitResp.ok || !saveWaitBody?.ok) {
+        squareStatusText.textContent = `Error: ${saveWaitBody?.error ?? 'Failed saving default wait'}`;
+        return;
+      }
+
+      squareStatusText.textContent = 'Saved. Connecting...';
+      await pollOrders();
+      squareStatusText.textContent = `Connected. ${state.orders.length} open orders.`;
     } catch (err) {
       squareStatusText.textContent = `Error: ${String(err)}`;
     } finally {
@@ -968,7 +1026,7 @@ async function init(): Promise<void> {
     const body = (await response.json().catch(() => null)) as {
       config?: {
         git?: { deployed?: boolean };
-        square?: { configured?: boolean; environment?: string; locationId?: string };
+        square?: { configured?: boolean; locationId?: string; defaultAvgWaitMs?: number };
       };
     } | null;
     state.deployed = !!body?.config?.git?.deployed;
@@ -977,11 +1035,13 @@ async function init(): Promise<void> {
     if (body?.config?.square?.locationId) {
       squareLocationInput.value = body.config.square.locationId;
     }
-    if (body?.config?.square?.environment) {
-      squareEnvSelect.value = body.config.square.environment;
-    }
     if (body?.config?.square?.configured) {
-      squareStatusText.textContent = 'Credentials saved. Polling...';
+      squareStatusText.textContent = 'Square secret is configured. Pick location and connect.';
+    } else {
+      squareStatusText.textContent = 'Missing Square access token secret in local config.';
+    }
+    if (typeof body?.config?.square?.defaultAvgWaitMs === 'number') {
+      defaultWaitInput.value = String(Math.max(0, Math.floor(body.config.square.defaultAvgWaitMs / 1000)));
     }
   } catch {}
 
